@@ -18,6 +18,7 @@ enum Error {
     InvalidOpcode,
     InvaildOperand,
     InvalidRegex(usize, &'static str),
+    ExecuteFailed(PC, &'static str),
 }
 
 // directly copy from c.(
@@ -222,7 +223,12 @@ impl Display for Program {
         while let Ok(opcode) = self.opcode_at(pc) {
             write!(f, "{:>3}:{}", pc.0, opcode)?;
             if let Some(next) = self.next_at(pc) {
-                write!(f, "({})", pc.0 + (next.0 - pc.0))?;
+                if opcode == Opcode::BACK{
+                    write!(f, "({})",pc.0 - (pc.0 - next.0))?;
+                }else{
+                    write!(f, "({})", pc.0 + (next.0 - pc.0))?;
+                }
+                
             } else {
                 write!(f, "(0)")?;
             }
@@ -257,6 +263,20 @@ fn is_mata(ch: char) -> bool {
     META_CHAR.find(ch).is_some()
 }
 
+pub struct Regexp{
+    startp: [PC; MAX_SUB_EXP],
+    endp:   [PC; MAX_SUB_EXP],
+    // below is used to optimize
+    regstart: char,
+    reganch: char,
+    regmust: String,
+    program: Program,
+}
+impl Regexp{
+    fn new(comp: Comp)->Regexp{
+        Regexp { startp: [PC::NULL; MAX_SUB_EXP], endp: [PC::NULL; MAX_SUB_EXP], regstart: '\0', reganch: '\0', regmust: String::new(), program: comp.program() }
+    }
+}
 //
 bitflags! {
     pub struct CompStatus: u8{
@@ -277,13 +297,17 @@ struct Comp<'a> {
 }
 
 impl<'a> Comp<'a> {
+    pub fn program(self)->Program{
+        self.program
+    }
+
     /*
     -   regcomp  compile a regular expression into internal code
     *
     *   compile regex will be two phase process. first for verify the validity of the regex, don't emit code.
     *
     */
-    pub fn regcomp(exp: &str) -> Result<Comp, Error> {
+    pub fn regcomp(exp: &str) -> Result<Regexp, Error> {
         let mut comp = Comp {
             regparse: peek_nth(exp.chars()),
             regposi: 0,
@@ -318,9 +342,11 @@ impl<'a> Comp<'a> {
         comp.paren_count = 1;
         comp.emit_code = true;
         comp.regc(Opcode::BEGIN.into());
-        let (_, reg_flag) = comp.reg(false)?;
-
-        Ok(comp)
+        let (_, _) = comp.reg(false)?;
+        let regexp = Regexp::new(comp);
+        // let scan = PragramCounter(1);
+        // TODO: 
+        Ok(regexp)
     }
     /*
      *  reg - regular expression, i.e. main body or parenthesized thing
@@ -647,12 +673,15 @@ impl<'a> Comp<'a> {
 
 
 /*
- * Work-variable struct for regexec().
+ * Work-variable struct for vm execute.
  */
 struct Exec<'a>{
     input: &'a str,
 }
 
+impl<'a> Exec<'a>{
+    
+}
 
 
 #[cfg(test)]
@@ -755,9 +784,10 @@ mod test {
         )
     }
 
-    fn regcomp(exp: &str)->Result<Comp, Error>{
-        Comp::regcomp(exp)
+    fn regcomp(exp: &str)->Result<(), Error>{
+        Comp::regcomp(exp).map(|_| ())
     }
+    
     #[test]
     fn test_regex_comp_ok_simple() {
         assert!(regcomp("a").is_ok());
@@ -776,5 +806,11 @@ mod test {
     #[test]
     fn test_regex_comp_err_simple(){
         assert!(regcomp("a**").is_err())
+    }
+
+    #[test]
+    fn test_regex_program_display(){
+        let re = Comp::regcomp("(a)+").unwrap();
+        println!("{}", re.program);
     }
 }
