@@ -64,6 +64,7 @@
 //! ```
 //!
 //!
+#![feature(iter_advance_by)]
 #[macro_use]
 extern crate enum_display_derive;
 

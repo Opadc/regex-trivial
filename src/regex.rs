@@ -6,6 +6,7 @@ use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 use std::{
     cell::RefCell,
+    collections::HashSet,
     fmt::Display,
     ops::{Add, AddAssign, Sub},
     rc::Rc,
@@ -229,7 +230,7 @@ impl Program {
     fn program(&self) -> Vec<u8> {
         self.bincode.borrow().to_owned()
     }
-    // return char(four byte) at pc
+    // return char(four bytes) at pc
     fn char_at(&self, pc: PC) -> Option<char> {
         let pc = pc.0;
         let bincode = self.bincode.borrow();
@@ -259,7 +260,7 @@ impl Display for Program {
                 write!(f, "(0)")?;
             }
             pc += 3;
-            if opcode == Opcode::ANY || opcode == Opcode::ANYBUT || opcode == Opcode::EXACTLY {
+            if opcode == Opcode::ANYOF || opcode == Opcode::ANYBUT || opcode == Opcode::EXACTLY {
                 let mut base = pc.0;
                 while base + 4 < self.pc.0 {
                     let mut digit = [0u8; 4];
@@ -519,7 +520,7 @@ impl<'a> Comp<'a> {
 
                    +-----------------------------+
                    |                             |
-                   v                             | 
+                   v                             |
                   ret   --->   BRANCH   --->   BACK    BRANCH   --->   NOTHING   --->   remain
                                   |                     ^  |                               ^
                                   |                     |  v                               |
@@ -535,15 +536,15 @@ impl<'a> Comp<'a> {
             self.regtail(ret, nothing)?;
         } else if op == '?' {
             /*
-                EXAMPLE
-                (ret)?remain
+               EXAMPLE
+               (ret)?remain
 
-                 
-                BRANCH   --->   ret   --->   BRANCH   --->   NOTHING   --->   remain
-                  |                           ^  v                               ^
-                  +---------------------------+  +-------------------------------+
 
-             */
+               BRANCH   --->   ret   --->   BRANCH   --->   NOTHING   --->   remain
+                 |                           ^  v                               ^
+                 +---------------------------+  +-------------------------------+
+
+            */
             self.reginsert(Opcode::BRANCH, ret)?;
             let branch = self.regnode(Opcode::BRANCH);
             self.regtail(ret, branch)?;
@@ -583,8 +584,55 @@ impl<'a> Comp<'a> {
                 flags |= CompStatus::HASWIDTH | CompStatus::SIMPLE;
             }
             Some('[') => {
-                // TODO:
-                todo!()
+                match self.exp_peak() {
+                    Some('^') => {
+                        ret = self.regnode(Opcode::ANYBUT);
+                        self.exp_advance();
+                    }
+                    Some(_) => {
+                        ret = self.regnode(Opcode::ANYOF);
+                    }
+                    _ => return Err(Error::InvalidRegex(self.regposi, "[ follow nothing")),
+                }
+                // TODO: ']' '-'
+
+                let mut last_ch = '\0';
+                while let Some(c) = self.exp_next() {
+                    if c == ']' {
+                        last_ch = c;
+                        break;
+                    }
+                    match c {
+                        '-' => match self.exp_peak() {
+                            Some(']') | None => {
+                                self.regchar('-');
+                            }
+                            Some(rangeend) => {
+                                if last_ch as u32 > rangeend as u32 {
+                                    return Err(Error::InvalidRegex(
+                                        self.regposi,
+                                        "invalid [] range",
+                                    ));
+                                }
+                                let rangestart =
+                                    char::from_u32(last_ch as u32 + 1).unwrap_or(last_ch);
+                                for r in rangestart..=rangeend {
+                                    self.regchar(r);
+                                }
+                                self.exp_advance();
+                            }
+                        },
+                        _ => {
+                            self.regchar(c);
+                        }
+                    }
+                    last_ch = c;
+                }
+                self.regchar('\0');
+                if last_ch != ']' {
+                    return Err(Error::InvalidRegex(self.regposi, "unmatched [] rangge"));
+                }
+                flags |= CompStatus::HASWIDTH | CompStatus::SIMPLE;
             }
 
             Some('(') => {
@@ -785,8 +833,7 @@ impl<'a> Exec<'a> {
             return Err(Error::ExecuteFailed(0, "corruptd regex program"));
         }
         let mut test_point = s.chars();
-        // ignore first BEGIN
-        prog.pc += 1;
+
         exec.regtry(prog)?;
         Ok(exec)
     }
@@ -794,11 +841,12 @@ impl<'a> Exec<'a> {
     fn regtry(&mut self, prog: &mut Program) -> Result<(), Error> {
         let match_begin = self.reginput.clone();
 
-        if self.regmatch(prog).is_ok() {
+        let result = self.regmatch(prog, PragramCounter(1));
+        if result.is_ok() {
             let matched = SubMatch::new(match_begin, self.reginput.clone());
             self.submatchs[0] = matched;
         }
-        Ok(())
+        result
     }
 
     /*
@@ -811,8 +859,8 @@ impl<'a> Exec<'a> {
     * need to know whether the rest of the match failed) by a loop instead of
     * by recursion.
     */
-    fn regmatch(&mut self, prog: &mut Program) -> Result<(), Error> {
-        let mut scan = prog.pc;
+    fn regmatch(&mut self, prog: &mut Program, start: PC) -> Result<(), Error> {
+        let mut scan = start;
 
         while scan != PC::NULL {
             let mut next = prog.next_at(scan).unwrap_or(PC::NULL);
@@ -866,8 +914,48 @@ impl<'a> Exec<'a> {
                         }
                     }
                 }
-                Opcode::ANYOF => {}
-                Opcode::ANYBUT => {}
+                Opcode::ANYOF => {
+                    let oprd = prog.operand_at(scan).expect("ANYOF contain as least one operand");
+
+                    let mut i = 0;
+                    let nc = if let Some(c) =  self.reginput.next(){
+                        c
+                    }else{
+                        return Err(Error::ExecuteFailed(self.looked_len, "match ANYOF failed, meet end"));
+                    };
+                    let mut finded = false;
+                    while let Some(ch) = prog.char_at(oprd+i){
+                        i += 4;
+                        if ch == nc{
+                            finded = true;
+                            break;
+                        } 
+                    }
+                    if !finded{
+                        return Err(Error::ExecuteFailed(self.looked_len, "match ANYOF failed, nothing match"));
+                    }
+                }
+                Opcode::ANYBUT => {
+                    let oprd = prog.operand_at(scan).expect("ANYOF contain as least one operand");
+
+                    let mut i = 0;
+                    let nc = if let Some(c) =  self.reginput.next(){
+                        c
+                    }else{
+                        return Err(Error::ExecuteFailed(self.looked_len, "match ANYOF failed, meet end"));
+                    };
+                    let mut finded = false;
+                    while let Some(ch) = prog.char_at(oprd+i){
+                        i += 1;
+                        if ch == nc{
+                            finded = true;
+                            break;
+                        } 
+                    }
+                    if finded{
+                        return Err(Error::ExecuteFailed(self.looked_len, "match ANYOF failed, in set"));
+                    }
+                }
                 Opcode::NOTHING => { /* do nothing( */ }
                 Opcode::BACK => { /* do nothing( */ }
 
@@ -883,11 +971,12 @@ impl<'a> Exec<'a> {
                     let no = prog.opcode_at(scan).unwrap() as u8 - Opcode::OPEN as u8;
                     let no = no as usize;
                     let input = self.reginput.clone();
-                    let mut split = prog.clone_with_pc(next);
-                    if self.regmatch(&mut split).is_ok() {
+
+                    if self.regmatch(prog, next).is_ok() {
                         if !self.submatchs[no].start_seted() {
                             self.submatchs[no].set_start(input);
                         }
+                        return Ok(());
                     } else {
                         return Err(Error::ExecuteFailed(self.looked_len, "submatch failed"));
                     }
@@ -905,35 +994,38 @@ impl<'a> Exec<'a> {
                     let no = prog.opcode_at(scan).unwrap() as u8 - Opcode::CLOSE as u8;
                     let no = no as usize;
                     let input = self.reginput.clone();
-                    let mut split = prog.clone_with_pc(next);
-                    if self.regmatch(&mut split).is_ok() {
+
+                    if self.regmatch(prog, next).is_ok() {
                         if !self.submatchs[no].end_seted() {
                             self.submatchs[no].set_end(input);
                         }
+                        return Ok(());
                     } else {
                         return Err(Error::ExecuteFailed(self.looked_len, "submatch failed"));
                     }
                 }
                 Opcode::BRANCH => {
                     let save = self.reginput.clone();
+                    let save_len = self.looked_len;
 
                     match prog.opcode_at(next) {
                         //
-                        Ok(op) if op == Opcode::BRANCH => loop {
+                        Ok(Opcode::BRANCH) => loop {
                             match prog.opcode_at(scan) {
-                                Ok(op) if op == Opcode::BRANCH => {
-                                    let alternative
-                                     = prog.operand_at(scan).unwrap();
-                                    let mut prog_clone = prog.clone_with_pc(alternative);
-                                    if self.regmatch(&mut prog_clone).is_ok() {
+                                Ok(Opcode::BRANCH) => {
+                                    let alternative = prog.operand_at(scan).unwrap();
+                                    if self.regmatch(prog, alternative).is_ok() {
                                         return Ok(());
                                     }
                                     self.reginput = save.clone();
+                                    self.looked_len = save_len;
                                     scan = prog.next_at(scan).unwrap_or(PC::NULL);
                                 }
                                 _ => {
-                                    // TODO: 
-                                    todo!()
+                                    return Err(Error::ExecuteFailed(
+                                        self.looked_len,
+                                        "all alternative match failed",
+                                    ));
                                 }
                             }
                         },
@@ -950,7 +1042,24 @@ impl<'a> Exec<'a> {
                     }
                 }
                 Opcode::STAR | Opcode::PLUS => {
-                    // TODO:
+                    let save = self.reginput.clone();
+                    let op = prog.opcode_at(scan).expect("already checked");
+                    let min = if op == Opcode::STAR { 0 } else { 1 };
+
+                    let max = self.regrepeat(prog, scan);
+                    // Greedy Capture
+                    for no in (min..=max).rev() {
+                        self.reginput = save.clone();
+                        self.reginput.advance_by(no).unwrap();
+
+                        if self.regmatch(prog, next).is_ok() {
+                            return Ok(());
+                        }
+                    }
+                    return Err(Error::ExecuteFailed(
+                        self.looked_len,
+                        "match STAR|PLUS failed",
+                    ));
                 }
                 Opcode::END => return Ok(()),
                 _ => {
@@ -977,8 +1086,8 @@ impl<'a> Exec<'a> {
                 // consider ".*"
                 self.reginput.as_str().len()
             }
-            Ok(Opcode::ANYOF) => 0,
-            Ok(Opcode::ANYBUT) => 0,
+            Ok(Opcode::ANYOF) => self.strcspn(prog, node),
+            Ok(Opcode::ANYBUT) => self.strcspn(prog, node),
             Ok(Opcode::EXACTLY) => {
                 // exactly single char
                 let mut count = 0;
@@ -999,6 +1108,27 @@ impl<'a> Exec<'a> {
                 panic!("call repeat with invalid oprand");
             }
         }
+    }
+
+
+    fn strcspn(&self, prog: &Program, node: PC) -> usize {
+        let mut i = 0;
+        let mut chset = HashSet::new();
+        while let Some(ch) = prog.char_at(node + i) {
+            if ch == '\0' {
+                break;
+            }
+            chset.insert(ch);
+            i += 1;
+        }
+        let chs = self.reginput.clone();
+        let mut res = 0;
+        chs.for_each(|c| {
+            if chset.contains(&c) {
+                res += 1
+            }
+        });
+        res
     }
     fn next_char(&mut self) -> Option<char> {
         self.looked_len += 1;
@@ -1160,16 +1290,23 @@ mod test {
         assert!(regcomp("a+").is_ok());
         assert!(regcomp("(a|b)c*d+").is_ok());
         assert!(regcomp("(a+|b)?").is_ok());
+        assert!(regcomp("[a]").is_ok());
+        assert!(regcomp("[a-b]").is_ok());
+        assert!(regcomp("[a-z1-9]").is_ok());
+        assert!(regcomp("[a-z]*").is_ok());
+        assert!(regcomp("[a-z]|[1-9]").is_ok());
+        assert!(regcomp("[a-z][1-9]").is_ok());
         assert!(regcomp("hello world! Have a good day.").is_ok());
     }
     #[test]
     fn test_regex_comp_err_simple() {
-        assert!(regcomp("a**").is_err())
+        assert!(regcomp("a**").is_err());
+        assert!(regcomp("[z-a]").is_err());
     }
 
     #[test]
     fn test_regex_program_display() {
-        let re = Comp::regcomp("a*").unwrap();
+        let re = Comp::regcomp("[a-z]").unwrap();
         println!("{}", re.program);
     }
 
@@ -1192,9 +1329,27 @@ mod test {
         assert!(regexec("(a)|(b)", "a").is_ok());
         assert!(regexec("(a)*", "").is_ok());
         assert!(regexec("(a)*", "aaa").is_ok());
+        assert!(regexec("[a]", "a").is_ok());
+        assert!(regexec("[a-z]", "g").is_ok());
+        assert!(regexec("[a-z1-9]", "1").is_ok());
+        assert!(regexec("[a-z]*", "abcdefg").is_ok());
+        assert!(regexec("[^a-z]*", "1").is_ok());
+    }
+
+    #[test]
+    fn tmp() {
+        assert!(regexec("[a-z]*", "absdawa").is_ok());
     }
     #[test]
     fn test_regex_exec_err_simple() {
-        assert!(regexec("a*", "bbb").is_err());
+        assert!(regexec("a", "b").is_err());
+        assert!(regexec("abcedf", "abced").is_err());
+        assert!(regexec("a|b|c", "d").is_err());
+        assert!(regexec("(a)", "b").is_err());
+        assert!(regexec("a+", "b").is_err());
+        assert!(regexec("a*b+c?", "aaaac").is_err());
+        assert!(regexec("[a]", "b").is_err());
+        assert!(regexec("[a-z]", "1").is_err());
+        assert!(regexec("[a-z]+", "123").is_err());
     }
 }
