@@ -5,20 +5,23 @@ use itertools::{peek_nth, PeekNth};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 use std::{
+    cell::RefCell,
     fmt::Display,
     ops::{Add, AddAssign, Sub},
+    process::id,
+    rc::Rc,
     str::Chars,
 };
 
 const MAX_SUB_EXP: usize = 9;
-const META_CHAR: & str = "^$.[()|?+*\\";
+const META_CHAR: &str = "^$.[()|?+*\\";
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Error {
+pub enum Error {
     OutOfBound,
     InvalidOpcode,
     InvaildOperand,
     InvalidRegex(usize, &'static str),
-    ExecuteFailed(PC, &'static str),
+    ExecuteFailed(usize, &'static str),
 }
 
 // directly copy from c.(
@@ -108,17 +111,23 @@ type PC = PragramCounter;
 #[derive(Debug, Clone)]
 struct Program {
     pub pc: PC,
-    bincode: Vec<u8>,
+    bincode: Rc<RefCell<Vec<u8>>>,
 }
 impl Program {
     pub fn new() -> Program {
         Program {
             pc: PragramCounter(0),
-            bincode: vec![],
+            bincode: Rc::new(RefCell::new(vec![])),
+        }
+    }
+    pub fn clone_with_pc(&self, pc: PC) -> Program {
+        Program {
+            pc,
+            bincode: Rc::clone(&self.bincode),
         }
     }
     pub fn reserve(&mut self, additional: usize) {
-        self.bincode.reserve(additional);
+        self.bincode.borrow_mut().reserve(additional);
     }
     fn is_node_out_of_bound(&self, pc: PC) -> Result<(), Error> {
         if pc + 2 >= self.pc {
@@ -130,13 +139,13 @@ impl Program {
     // return the opcode at the position pc in bincode.
     pub fn opcode_at(&self, pc: PC) -> Result<Opcode, Error> {
         self.is_node_out_of_bound(pc)?;
-        Opcode::try_from(self.bincode[pc.0]).map_err(|_| Error::InvalidOpcode)
+        Opcode::try_from(self.bincode.borrow()[pc.0]).map_err(|_| Error::InvalidOpcode)
     }
     // return the next pc at the position pc in bincode.
     pub fn next_at(&self, pc: PC) -> Option<PC> {
         self.is_node_out_of_bound(pc).ok()?;
-        let high_byte = self.bincode[(pc + 1).0] as usize;
-        let low_byte = self.bincode[(pc + 2).0] as usize;
+        let high_byte = self.bincode.borrow()[(pc + 1).0] as usize;
+        let low_byte = self.bincode.borrow()[(pc + 2).0] as usize;
         let offset = ((high_byte & 0o177) << 8) + low_byte;
 
         if offset == 0 {
@@ -158,14 +167,14 @@ impl Program {
     // push a new node in bincode, return origial pc before emit.
     pub fn emit_node(&mut self, opcode: Opcode) -> PC {
         let old_pc = self.pc;
-        self.bincode.push(opcode.into());
-        self.bincode.push(0);
-        self.bincode.push(0);
+        self.bincode.borrow_mut().push(opcode.into());
+        self.bincode.borrow_mut().push(0);
+        self.bincode.borrow_mut().push(0);
         self.pc += 3;
         old_pc
     }
     pub fn emit_byte(&mut self, byte: u8) {
-        self.bincode.push(byte);
+        self.bincode.borrow_mut().push(byte);
         self.pc += 1;
     }
 
@@ -173,17 +182,19 @@ impl Program {
     // Means relocating the operand.
     pub fn insert_node(&mut self, opcode: Opcode, opnd: PC) -> Result<(), Error> {
         self.is_node_out_of_bound(opnd)?;
-        self.bincode.push(0);
-        self.bincode.push(0);
-        self.bincode.push(0);
+        self.bincode.borrow_mut().push(0);
+        self.bincode.borrow_mut().push(0);
+        self.bincode.borrow_mut().push(0);
         let begin = opnd.0;
-        for i in (begin + 3..self.bincode.len()).rev() {
-            self.bincode[i] = self.bincode[i - 3];
+        let end = self.bincode.borrow().len();
+        for i in (begin + 3..end).rev() {
+            let tmp = self.bincode.borrow()[i - 3];
+            self.bincode.borrow_mut()[i] = tmp;
         }
 
-        self.bincode[begin] = opcode.into();
-        self.bincode[begin + 1] = 0;
-        self.bincode[begin + 2] = 0;
+        self.bincode.borrow_mut()[begin] = opcode.into();
+        self.bincode.borrow_mut()[begin + 1] = 0;
+        self.bincode.borrow_mut()[begin + 2] = 0;
         self.pc += 3;
         Ok(())
     }
@@ -199,8 +210,8 @@ impl Program {
         } else {
             new_tail.0 - chain.0
         };
-        self.bincode[chain.0 + 1] = ((offset >> 8) & 0o177) as u8;
-        self.bincode[chain.0 + 2] = (offset & 0o377) as u8;
+        self.bincode.borrow_mut()[chain.0 + 1] = ((offset >> 8) & 0o177) as u8;
+        self.bincode.borrow_mut()[chain.0 + 2] = (offset & 0o377) as u8;
         Ok(())
     }
 
@@ -215,6 +226,10 @@ impl Program {
             )
         }
     }
+
+    fn program(&self) -> Vec<u8> {
+        self.bincode.borrow().to_owned()
+    }
 }
 impl Display for Program {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -223,12 +238,11 @@ impl Display for Program {
         while let Ok(opcode) = self.opcode_at(pc) {
             write!(f, "{:>3}:{}", pc.0, opcode)?;
             if let Some(next) = self.next_at(pc) {
-                if opcode == Opcode::BACK{
-                    write!(f, "({})",pc.0 - (pc.0 - next.0))?;
-                }else{
+                if opcode == Opcode::BACK {
+                    write!(f, "({})", pc.0 - (pc.0 - next.0))?;
+                } else {
                     write!(f, "({})", pc.0 + (next.0 - pc.0))?;
                 }
-                
             } else {
                 write!(f, "(0)")?;
             }
@@ -237,7 +251,7 @@ impl Display for Program {
                 let mut base = pc.0;
                 while base + 4 < self.pc.0 {
                     let mut digit = [0u8; 4];
-                    digit.copy_from_slice(&self.bincode[base..base + 4]);
+                    digit.copy_from_slice(&self.bincode.borrow_mut()[base..base + 4]);
                     pc += 4;
                     base = pc.0;
                     let ch = u32::from_be_bytes(digit);
@@ -263,20 +277,6 @@ fn is_mata(ch: char) -> bool {
     META_CHAR.find(ch).is_some()
 }
 
-pub struct Regexp{
-    startp: [PC; MAX_SUB_EXP],
-    endp:   [PC; MAX_SUB_EXP],
-    // below is used to optimize
-    regstart: char,
-    reganch: char,
-    regmust: String,
-    program: Program,
-}
-impl Regexp{
-    fn new(comp: Comp)->Regexp{
-        Regexp { startp: [PC::NULL; MAX_SUB_EXP], endp: [PC::NULL; MAX_SUB_EXP], regstart: '\0', reganch: '\0', regmust: String::new(), program: comp.program() }
-    }
-}
 //
 bitflags! {
     pub struct CompStatus: u8{
@@ -297,7 +297,7 @@ struct Comp<'a> {
 }
 
 impl<'a> Comp<'a> {
-    pub fn program(self)->Program{
+    pub fn program(self) -> Program {
         self.program
     }
 
@@ -307,7 +307,7 @@ impl<'a> Comp<'a> {
     *   compile regex will be two phase process. first for verify the validity of the regex, don't emit code.
     *
     */
-    pub fn regcomp(exp: &str) -> Result<Regexp, Error> {
+    pub fn regcomp(exp: &str) -> Result<Comp, Error> {
         let mut comp = Comp {
             regparse: peek_nth(exp.chars()),
             regposi: 0,
@@ -317,19 +317,17 @@ impl<'a> Comp<'a> {
             code_size: 0,
         };
         comp.regc(Opcode::BEGIN.into());
-        comp.reg(false).map_err(|err|{
-            match err{
-                Error::InvalidRegex(mut posi, err_msg) => {
-                    println!("{}",exp);
-                    while posi > 0{
-                        print!(" ");
-                        posi -= 1;
-                    }
-                    println!("^   {}",err_msg);
-                    err
-                },
-                _ => panic!("internal error should not export here")
+        comp.reg(false).map_err(|err| match err {
+            Error::InvalidRegex(mut posi, err_msg) => {
+                println!("{}", exp);
+                while posi > 0 {
+                    print!(" ");
+                    posi -= 1;
+                }
+                println!("^   {}", err_msg);
+                err
             }
+            _ => panic!("internal error should not export here"),
         })?;
 
         if comp.code_size >= 0x7fff {
@@ -343,10 +341,10 @@ impl<'a> Comp<'a> {
         comp.emit_code = true;
         comp.regc(Opcode::BEGIN.into());
         let (_, _) = comp.reg(false)?;
-        let regexp = Regexp::new(comp);
+        // let regexp = Regexp::new(comp);
         // let scan = PragramCounter(1);
-        // TODO: 
-        Ok(regexp)
+        // TODO:
+        Ok(comp)
     }
     /*
      *  reg - regular expression, i.e. main body or parenthesized thing
@@ -403,12 +401,15 @@ impl<'a> Comp<'a> {
 
         /* Check for proper termination. */
         if paren && self.exp_next() != Some(')') {
-            return Err(Error::InvalidRegex(self.regposi,"unterminated ()"));
+            return Err(Error::InvalidRegex(self.regposi, "unterminated ()"));
         } else if !paren && self.exp_peak().is_some() {
             if self.exp_peak() == Some(')') {
-                return Err(Error::InvalidRegex(self.regposi,"unmatched ()"));
+                return Err(Error::InvalidRegex(self.regposi, "unmatched ()"));
             } else {
-                return Err(Error::InvalidRegex(self.regposi,"internal error: junk on end"));
+                return Err(Error::InvalidRegex(
+                    self.regposi,
+                    "internal error: junk on end",
+                ));
             }
         }
         Ok((ret, flags))
@@ -462,7 +463,10 @@ impl<'a> Comp<'a> {
             return Ok((ret, flags));
         }
         if !atom_flags.contains(CompStatus::HASWIDTH) && op != '?' {
-            return Err(Error::InvalidRegex(self.regposi,"*+ operand could be empty"));
+            return Err(Error::InvalidRegex(
+                self.regposi,
+                "*+ operand could be empty",
+            ));
         }
         flags = match op {
             '*' => CompStatus::WORST | CompStatus::SPSTART,
@@ -504,7 +508,7 @@ impl<'a> Comp<'a> {
         self.exp_advance();
         if let Some(ch) = self.exp_peak() {
             if is_repn(ch) {
-                return Err(Error::InvalidRegex(self.regposi,"nested *?+"));
+                return Err(Error::InvalidRegex(self.regposi, "nested *?+"));
             }
         }
         Ok((ret, flags))
@@ -542,10 +546,13 @@ impl<'a> Comp<'a> {
                 flags |= sub_reg_flags & (CompStatus::HASWIDTH | CompStatus::SPSTART);
             }
             Some('|') | Some(')') | None => {
-                return Err(Error::InvalidRegex(self.regposi,"internal error: \0|) unexpected"))
+                return Err(Error::InvalidRegex(
+                    self.regposi,
+                    "internal error: \0|) unexpected",
+                ))
             }
             Some('?') | Some('+') | Some('*') => {
-                return Err(Error::InvalidRegex(self.regposi,"?+* follows nothing"));
+                return Err(Error::InvalidRegex(self.regposi, "?+* follows nothing"));
             }
             Some('\\') => {
                 if let Some(ch) = self.exp_peak() {
@@ -554,7 +561,7 @@ impl<'a> Comp<'a> {
                     self.regchar(ch);
                     flags |= CompStatus::HASWIDTH | CompStatus::SIMPLE;
                 } else {
-                    return Err(Error::InvalidRegex(self.regposi,"trailing \\"));
+                    return Err(Error::InvalidRegex(self.regposi, "trailing \\"));
                 }
             }
 
@@ -562,7 +569,10 @@ impl<'a> Comp<'a> {
             Some(ch) => {
                 ret = self.regnode(Opcode::EXACTLY);
                 if is_mata(ch) {
-                    return Err(Error::InvalidRegex(self.regposi,"internal error: mata char unexpected"));
+                    return Err(Error::InvalidRegex(
+                        self.regposi,
+                        "internal error: mata char unexpected",
+                    ));
                 }
                 // we have consume a ch. append it to EXACTLY oprand.
                 self.regchar(ch);
@@ -671,18 +681,247 @@ impl<'a> Comp<'a> {
     }
 }
 
+#[derive(Clone, Default)]
+struct SubMatch<'a> {
+    start: Option<Chars<'a>>,
+    end: Option<Chars<'a>>,
+}
 
+impl<'a> SubMatch<'a> {
+    fn new(start: Chars<'a>, end: Chars<'a>) -> SubMatch<'a> {
+        SubMatch {
+            start: Some(start),
+            end: Some(end),
+        }
+    }
+    fn start_seted(&self) -> bool {
+        self.start.is_some()
+    }
+    fn end_seted(&self) -> bool {
+        self.end.is_some()
+    }
+    fn set_start(&mut self, start: Chars<'a>) {
+        self.start = Some(start);
+    }
+    fn set_end(&mut self, end: Chars<'a>) {
+        self.end = Some(end);
+    }
+    fn is_fine(&self) -> bool {
+        self.start.is_some() && self.end.is_some()
+    }
+}
 /*
  * Work-variable struct for vm execute.
  */
-struct Exec<'a>{
-    input: &'a str,
+struct Exec<'a> {
+    reginput: Chars<'a>,
+    regbol: Chars<'a>,
+    looked_len: usize,
+    submatchs: [SubMatch<'a>; MAX_SUB_EXP],
 }
 
-impl<'a> Exec<'a>{
-    
+impl<'a> Exec<'a> {
+    pub fn regexec(comp: &mut Comp, s: &'a str) -> Result<Exec<'a>, Error> {
+        let mut exec = Exec {
+            reginput: s.chars(),
+            regbol: s.chars(),
+            looked_len: 0,
+            submatchs: Default::default(),
+        };
+        let prog = &mut comp.program;
+        let pc = PragramCounter(0);
+        let first_op = prog
+            .opcode_at(pc)
+            .map_err(|_| Error::ExecuteFailed(0, "corrupted regex program"))?;
+        // program valid ?
+        if first_op != Opcode::BEGIN {
+            return Err(Error::ExecuteFailed(0, "corruptd regex program"));
+        }
+        let mut test_point = s.chars();
+        // ignore first BEGIN
+        prog.pc += 1;
+        exec.regtry(prog)?;
+        Ok(exec)
+    }
+
+    fn regtry(&mut self, prog: &mut Program) -> Result<(), Error> {
+        let match_begin = self.reginput.clone();
+
+        if self.regmatch(prog).is_ok() {
+            let matched = SubMatch::new(match_begin, self.reginput.clone());
+            self.submatchs[0] = matched;
+        }
+        Ok(())
+    }
+
+    fn regmatch(&mut self, prog: &mut Program) -> Result<(), Error> {
+        let mut scan = prog.pc;
+
+        while scan != PC::NULL {
+            let mut next = prog.next_at(scan).unwrap_or(PC::NULL);
+            let opcode = prog
+                .opcode_at(scan)
+                .map_err(|_| Error::ExecuteFailed(self.looked_len, "regex program corrupted"))?;
+            match opcode {
+                Opcode::BOL => {
+                    if self.reginput.as_str() != self.regbol.as_str() {
+                        return Err(Error::ExecuteFailed(
+                            self.looked_len,
+                            "match begin of line failed",
+                        ));
+                    }
+                }
+                Opcode::EOL => {
+                    if self.next_char() != None {
+                        return Err(Error::ExecuteFailed(
+                            self.looked_len,
+                            "match end of line failed",
+                        ));
+                    }
+                }
+                Opcode::ANY => {
+                    if self.next_char() == None {
+                        return Err(Error::ExecuteFailed(
+                            self.looked_len,
+                            "match any char failed",
+                        ));
+                    }
+                }
+                Opcode::EXACTLY => {
+                    let opnd = prog.operand_at(scan).ok_or(Error::InvaildOperand)?;
+                    let mut idx = opnd.0;
+                    let mut c;
+                    loop {
+                        let mut tmp_ary = [0; 4];
+                        tmp_ary.copy_from_slice(&prog.bincode.borrow()[idx..idx + 4]);
+                        c = u32::from_be_bytes(tmp_ary);
+                        if c == 0 {
+                            break;
+                        }
+                        match self.next_char() {
+                            Some(ch) if ch as u32 == c => idx += 4,
+                            _ => {
+                                return Err(Error::ExecuteFailed(
+                                    self.looked_len,
+                                    "match exactly failed",
+                                ))
+                            }
+                        }
+                    }
+                }
+                Opcode::ANYOF => {}
+                Opcode::ANYBUT => {}
+                Opcode::NOTHING => { /* do nothing( */ }
+                Opcode::BACK => { /* do nothing( */ }
+
+                Opcode::OPEN1
+                | Opcode::OPEN2
+                | Opcode::OPEN3
+                | Opcode::OPEN4
+                | Opcode::OPEN5
+                | Opcode::OPEN6
+                | Opcode::OPEN7
+                | Opcode::OPEN8
+                | Opcode::OPEN9 => {
+                    let no = prog.opcode_at(scan).unwrap() as u8 - Opcode::OPEN as u8;
+                    let no = no as usize;
+                    let input = self.reginput.clone();
+                    let mut split = prog.clone_with_pc(next);
+                    if self.regmatch(&mut split).is_ok() {
+                        if !self.submatchs[no].start_seted() {
+                            self.submatchs[no].set_start(input);
+                        }
+                    } else {
+                        return Err(Error::ExecuteFailed(self.looked_len, "submatch failed"));
+                    }
+                }
+
+                Opcode::CLOSE1
+                | Opcode::CLOSE2
+                | Opcode::CLOSE3
+                | Opcode::CLOSE4
+                | Opcode::CLOSE5
+                | Opcode::CLOSE6
+                | Opcode::CLOSE7
+                | Opcode::CLOSE8
+                | Opcode::CLOSE9 => {
+                    let no = prog.opcode_at(scan).unwrap() as u8 - Opcode::CLOSE as u8;
+                    let no = no as usize;
+                    let input = self.reginput.clone();
+                    let mut split = prog.clone_with_pc(next);
+                    if self.regmatch(&mut split).is_ok() {
+                        if !self.submatchs[no].end_seted() {
+                            self.submatchs[no].set_end(input);
+                        }
+                    } else {
+                        return Err(Error::ExecuteFailed(self.looked_len, "submatch failed"));
+                    }
+                }
+                Opcode::BRANCH => {
+                    let save = self.reginput.clone();
+
+                    match prog.opcode_at(next) {
+                        //
+                        Ok(op) if op == Opcode::BRANCH => loop {
+                            match prog.opcode_at(scan) {
+                                Ok(op) if op == Opcode::BRANCH => {
+                                    let oprd = prog.operand_at(scan).unwrap();
+                                    let mut prog_clone = prog.clone_with_pc(oprd);
+                                    if self.regmatch(&mut prog_clone).is_ok() {
+                                        return Ok(());
+                                    }
+                                    self.reginput = save.clone();
+                                    scan = prog.next_at(scan).unwrap_or(PC::NULL);
+                                }
+                                _ => {
+                                    todo!()
+                                }
+                            }
+                        },
+                        // no choice
+                        Ok(op) => {
+                            next = prog.operand_at(scan).unwrap();
+                        }
+                        Err(err) => {
+                            return Err(Error::ExecuteFailed(
+                                self.looked_len,
+                                "match branch failed, opcode of next invalid",
+                            ));
+                        }
+                    }
+                }
+                Opcode::STAR | Opcode::PLUS => {}
+                Opcode::END => return Ok(()),
+                _ => {
+                    return Err(Error::ExecuteFailed(self.looked_len, "unexpected program"));
+                }
+            };
+            scan = next;
+        }
+
+        Err(Error::ExecuteFailed(
+            self.looked_len,
+            "unexpeced return point",
+        ))
+    }
+
+    fn next_char(&mut self) -> Option<char> {
+        self.looked_len += 1;
+        self.reginput.next()
+    }
 }
 
+pub struct Regex<'a> {
+    program: Program,
+    submatchs: [Option<SubMatch<'a>>; MAX_SUB_EXP],
+}
+impl<'a> Regex<'a> {
+    pub fn new(re: &str) -> Result<Regex, Error> {
+        todo!()
+    }
+    pub fn find(&mut self, s: &str) {}
+    pub fn captures(&self) {}
+}
 
 #[cfg(test)]
 mod test {
@@ -711,26 +950,26 @@ mod test {
         prog.emit_byte(10);
         prog.emit_byte(12);
         prog.emit_byte(100);
-        assert_eq!(prog.bincode, vec![10, 12, 100]);
         assert_eq!(prog.pc, PragramCounter(3));
+        assert_eq!(prog.program(), vec![10, 12, 100]);
     }
     #[test]
     fn test_program_emit_node() {
         let mut prog = Program::new();
         {
             let pc = prog.emit_node(Opcode::BEGIN);
-            assert_eq!(prog.bincode, vec![Opcode::BEGIN.into(), 0, 0]);
             assert_eq!(pc, PragramCounter(0));
             assert_eq!(Ok(Opcode::BEGIN), prog.opcode_at(pc));
+            assert_eq!(prog.program(), vec![Opcode::BEGIN.into(), 0, 0]);
         }
         {
             let pc = prog.emit_node(Opcode::ANY);
-            assert_eq!(
-                prog.bincode,
-                vec![Opcode::BEGIN.into(), 0, 0, Opcode::ANY.into(), 0, 0]
-            );
             assert_eq!(pc, PragramCounter(3));
             assert_eq!(Ok(Opcode::ANY), prog.opcode_at(pc));
+            assert_eq!(
+                prog.program(),
+                vec![Opcode::BEGIN.into(), 0, 0, Opcode::ANY.into(), 0, 0]
+            );
         }
     }
     #[test]
@@ -759,14 +998,14 @@ mod test {
         let f = prog.emit_node(Opcode::ANY);
         prog.insert_node(Opcode::STAR, f).unwrap();
         assert_eq!(
-            prog.bincode,
+            prog.program(),
             vec![Opcode::STAR.into(), 0, 0, Opcode::ANY.into(), 0, 0]
         );
 
         let s = prog.emit_node(Opcode::ANY);
         prog.insert_node(Opcode::PLUS, s).unwrap();
         assert_eq!(
-            prog.bincode,
+            prog.program(),
             vec![
                 Opcode::STAR.into(),
                 0,
@@ -784,10 +1023,10 @@ mod test {
         )
     }
 
-    fn regcomp(exp: &str)->Result<(), Error>{
+    fn regcomp(exp: &str) -> Result<(), Error> {
         Comp::regcomp(exp).map(|_| ())
     }
-    
+
     #[test]
     fn test_regex_comp_ok_simple() {
         assert!(regcomp("a").is_ok());
@@ -801,16 +1040,38 @@ mod test {
         assert!(regcomp("(a|b)c*d+").is_ok());
         assert!(regcomp("(a+|b)?").is_ok());
         assert!(regcomp("hello world! Have a good day.").is_ok());
-        
     }
     #[test]
-    fn test_regex_comp_err_simple(){
+    fn test_regex_comp_err_simple() {
         assert!(regcomp("a**").is_err())
     }
 
     #[test]
-    fn test_regex_program_display(){
-        let re = Comp::regcomp("(a)+").unwrap();
+    fn test_regex_program_display() {
+        let re = Comp::regcomp("a|b").unwrap();
         println!("{}", re.program);
     }
+
+    fn regexec(re: &str, s: &str) -> Result<(), Error> {
+        let mut comp = Comp::regcomp(re)?;
+        Exec::regexec(&mut comp, s).map(|_| ())
+    }
+    #[test]
+    fn test_regex_exec_ok_simple() {
+        assert!(regexec("a", "a").is_ok());
+        assert!(regexec("abcedf", "abcedf").is_ok());
+        assert!(regexec("a|b|c", "a").is_ok());
+        assert!(regexec("a|b|c", "c").is_ok());
+        assert!(regexec("a|b|.", "d").is_ok());
+        assert!(regexec("(a)", "a").is_ok());
+        assert!(regexec("((((((a))))))", "a").is_ok());
+        assert!(regexec("a*", "aaaaaaaaaa").is_ok());
+        assert!(regexec("a*|b", "").is_ok());
+        assert!(regexec("a*b+c?", "aaaab").is_ok());
+        assert!(regexec("(a)|(b)", "a").is_ok());
+        assert!(regexec("(a)*", "").is_ok());
+        assert!(regexec("(a)*", "aaa").is_ok());
+    }
+    #[test]
+    fn test_regex_exec_err_simple() {}
 }
