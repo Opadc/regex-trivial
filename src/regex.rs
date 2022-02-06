@@ -111,23 +111,18 @@ type PC = PragramCounter;
 #[derive(Debug, Clone)]
 struct Program {
     pub pc: PC,
-    bincode: Rc<RefCell<Vec<u8>>>,
+    bincode: Vec<u8>,
 }
 impl Program {
     pub fn new() -> Program {
         Program {
             pc: PragramCounter(0),
-            bincode: Rc::new(RefCell::new(vec![])),
+            bincode: vec![],
         }
     }
-    pub fn clone_with_pc(&self, pc: PC) -> Program {
-        Program {
-            pc,
-            bincode: Rc::clone(&self.bincode),
-        }
-    }
+
     pub fn reserve(&mut self, additional: usize) {
-        self.bincode.borrow_mut().reserve(additional);
+        self.bincode.reserve(additional);
     }
     fn is_node_out_of_bound(&self, pc: PC) -> Result<(), Error> {
         if pc + 2 >= self.pc {
@@ -139,13 +134,13 @@ impl Program {
     // return the opcode at the position pc in bincode.
     pub fn opcode_at(&self, pc: PC) -> Result<Opcode, Error> {
         self.is_node_out_of_bound(pc)?;
-        Opcode::try_from(self.bincode.borrow()[pc.0]).map_err(|_| Error::InvalidOpcode)
+        Opcode::try_from(self.bincode[pc.0]).map_err(|_| Error::InvalidOpcode)
     }
     // return the next pc at the position pc in bincode.
     pub fn next_at(&self, pc: PC) -> Option<PC> {
         self.is_node_out_of_bound(pc).ok()?;
-        let high_byte = self.bincode.borrow()[(pc + 1).0] as usize;
-        let low_byte = self.bincode.borrow()[(pc + 2).0] as usize;
+        let high_byte = self.bincode[(pc + 1).0] as usize;
+        let low_byte = self.bincode[(pc + 2).0] as usize;
         let offset = ((high_byte & 0o177) << 8) + low_byte;
 
         if offset == 0 {
@@ -167,14 +162,14 @@ impl Program {
     // push a new node in bincode, return origial pc before emit.
     pub fn emit_node(&mut self, opcode: Opcode) -> PC {
         let old_pc = self.pc;
-        self.bincode.borrow_mut().push(opcode.into());
-        self.bincode.borrow_mut().push(0);
-        self.bincode.borrow_mut().push(0);
+        self.bincode.push(opcode.into());
+        self.bincode.push(0);
+        self.bincode.push(0);
         self.pc += 3;
         old_pc
     }
     pub fn emit_byte(&mut self, byte: u8) {
-        self.bincode.borrow_mut().push(byte);
+        self.bincode.push(byte);
         self.pc += 1;
     }
 
@@ -182,19 +177,19 @@ impl Program {
     // Means relocating the operand.
     pub fn insert_node(&mut self, opcode: Opcode, opnd: PC) -> Result<(), Error> {
         self.is_node_out_of_bound(opnd)?;
-        self.bincode.borrow_mut().push(0);
-        self.bincode.borrow_mut().push(0);
-        self.bincode.borrow_mut().push(0);
+        self.bincode.push(0);
+        self.bincode.push(0);
+        self.bincode.push(0);
         let begin = opnd.0;
-        let end = self.bincode.borrow().len();
+        let end = self.bincode.len();
         for i in (begin + 3..end).rev() {
-            let tmp = self.bincode.borrow()[i - 3];
-            self.bincode.borrow_mut()[i] = tmp;
+            let tmp = self.bincode[i - 3];
+            self.bincode[i] = tmp;
         }
 
-        self.bincode.borrow_mut()[begin] = opcode.into();
-        self.bincode.borrow_mut()[begin + 1] = 0;
-        self.bincode.borrow_mut()[begin + 2] = 0;
+        self.bincode[begin] = opcode.into();
+        self.bincode[begin + 1] = 0;
+        self.bincode[begin + 2] = 0;
         self.pc += 3;
         Ok(())
     }
@@ -210,8 +205,8 @@ impl Program {
         } else {
             new_tail.0 - chain.0
         };
-        self.bincode.borrow_mut()[chain.0 + 1] = ((offset >> 8) & 0o177) as u8;
-        self.bincode.borrow_mut()[chain.0 + 2] = (offset & 0o377) as u8;
+        self.bincode[chain.0 + 1] = ((offset >> 8) & 0o177) as u8;
+        self.bincode[chain.0 + 2] = (offset & 0o377) as u8;
         Ok(())
     }
 
@@ -228,12 +223,12 @@ impl Program {
     }
 
     fn program(&self) -> Vec<u8> {
-        self.bincode.borrow().to_owned()
+        self.bincode.to_owned()
     }
     // return char(four bytes) at pc
     fn char_at(&self, pc: PC) -> Option<char> {
         let pc = pc.0;
-        let bincode = self.bincode.borrow();
+        let bincode = &self.bincode;
         if pc + 4 > bincode.len() {
             None
         } else {
@@ -264,7 +259,7 @@ impl Display for Program {
                 let mut base = pc.0;
                 while base + 4 < self.pc.0 {
                     let mut digit = [0u8; 4];
-                    digit.copy_from_slice(&self.bincode.borrow_mut()[base..base + 4]);
+                    digit.copy_from_slice(&self.bincode[base..base + 4]);
                     pc += 4;
                     base = pc.0;
                     let ch = u32::from_be_bytes(digit);
@@ -898,7 +893,7 @@ impl<'a> Exec<'a> {
                     let mut c;
                     loop {
                         let mut tmp_ary = [0; 4];
-                        tmp_ary.copy_from_slice(&prog.bincode.borrow()[idx..idx + 4]);
+                        tmp_ary.copy_from_slice(&prog.bincode[idx..idx + 4]);
                         c = u32::from_be_bytes(tmp_ary);
                         if c == 0 {
                             break;
@@ -1009,7 +1004,7 @@ impl<'a> Exec<'a> {
                     let save_len = self.looked_len;
 
                     match prog.opcode_at(next) {
-                        //
+                       
                         Ok(Opcode::BRANCH) => loop {
                             match prog.opcode_at(scan) {
                                 Ok(Opcode::BRANCH) => {
@@ -1051,7 +1046,7 @@ impl<'a> Exec<'a> {
                     for no in (min..=max).rev() {
                         self.reginput = save.clone();
                         self.reginput.advance_by(no).unwrap();
-
+                        // Try 
                         if self.regmatch(prog, next).is_ok() {
                             return Ok(());
                         }
@@ -1119,7 +1114,7 @@ impl<'a> Exec<'a> {
                 break;
             }
             chset.insert(ch);
-            i += 1;
+            i += 4;
         }
         let chs = self.reginput.clone();
         let mut res = 0;
