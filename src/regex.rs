@@ -8,7 +8,6 @@ use std::{
     cell::RefCell,
     fmt::Display,
     ops::{Add, AddAssign, Sub},
-    process::id,
     rc::Rc,
     str::Chars,
 };
@@ -229,6 +228,19 @@ impl Program {
 
     fn program(&self) -> Vec<u8> {
         self.bincode.borrow().to_owned()
+    }
+    // return char(four byte) at pc
+    fn char_at(&self, pc: PC) -> Option<char> {
+        let pc = pc.0;
+        let bincode = self.bincode.borrow();
+        if pc + 4 > bincode.len() {
+            None
+        } else {
+            let mut buf = [0; 4];
+            buf.copy_from_slice(&bincode[pc..pc + 4]);
+            let ch = u32::from_be_bytes(buf);
+            char::from_u32(ch)
+        }
     }
 }
 impl Display for Program {
@@ -478,6 +490,18 @@ impl<'a> Comp<'a> {
         if op == '*' && enough_simple {
             self.reginsert(Opcode::STAR, ret)?;
         } else if op == '*' {
+            /*
+                EXAMPLE
+                (ret)*remain:
+
+                  +---------------------------+
+                  |                           |
+                  v                           |
+                BRANCH   --->   ret   --->   BACK   BRANCH   --->   NOTHING   --->   remain
+                  |                                  ^  |                               ^
+                  |                                  |  v                               |
+                  +----------------------------------+  +-------------------------------+
+            */
             self.reginsert(Opcode::BRANCH, ret)?;
             let back = self.regnode(Opcode::BACK);
             self.regoptail(ret, back)?;
@@ -489,6 +513,18 @@ impl<'a> Comp<'a> {
         } else if op == '+' && enough_simple {
             self.reginsert(Opcode::PLUS, ret)?;
         } else if op == '+' {
+            /*
+                EXAMPLE
+                (ret)+remain:
+
+                   +-----------------------------+
+                   |                             |
+                   v                             | 
+                  ret   --->   BRANCH   --->   BACK    BRANCH   --->   NOTHING   --->   remain
+                                  |                     ^  |                               ^
+                                  |                     |  v                               |
+                                  +----------------------  --------------------------------+
+            */
             let branch = self.regnode(Opcode::BRANCH);
             self.regtail(ret, branch)?;
             let back = self.regnode(Opcode::BACK);
@@ -498,6 +534,16 @@ impl<'a> Comp<'a> {
             let nothing = self.regnode(Opcode::NOTHING);
             self.regtail(ret, nothing)?;
         } else if op == '?' {
+            /*
+                EXAMPLE
+                (ret)?remain
+
+                 
+                BRANCH   --->   ret   --->   BRANCH   --->   NOTHING   --->   remain
+                  |                           ^  v                               ^
+                  +---------------------------+  +-------------------------------+
+
+             */
             self.reginsert(Opcode::BRANCH, ret)?;
             let branch = self.regnode(Opcode::BRANCH);
             self.regtail(ret, branch)?;
@@ -537,6 +583,7 @@ impl<'a> Comp<'a> {
                 flags |= CompStatus::HASWIDTH | CompStatus::SIMPLE;
             }
             Some('[') => {
+                // TODO:
                 todo!()
             }
 
@@ -754,6 +801,16 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
+    /*
+    - regmatch - main matching routine
+    *
+    * Conceptually the strategy is simple:  check to see whether the current
+    * node matches, call self recursively to see whether the rest matches,
+    * and then act accordingly.  In practice we make some effort to avoid
+    * recursion, in particular by going through "ordinary" nodes (that don't
+    * need to know whether the rest of the match failed) by a loop instead of
+    * by recursion.
+    */
     fn regmatch(&mut self, prog: &mut Program) -> Result<(), Error> {
         let mut scan = prog.pc;
 
@@ -865,8 +922,9 @@ impl<'a> Exec<'a> {
                         Ok(op) if op == Opcode::BRANCH => loop {
                             match prog.opcode_at(scan) {
                                 Ok(op) if op == Opcode::BRANCH => {
-                                    let oprd = prog.operand_at(scan).unwrap();
-                                    let mut prog_clone = prog.clone_with_pc(oprd);
+                                    let alternative
+                                     = prog.operand_at(scan).unwrap();
+                                    let mut prog_clone = prog.clone_with_pc(alternative);
                                     if self.regmatch(&mut prog_clone).is_ok() {
                                         return Ok(());
                                     }
@@ -874,15 +932,16 @@ impl<'a> Exec<'a> {
                                     scan = prog.next_at(scan).unwrap_or(PC::NULL);
                                 }
                                 _ => {
+                                    // TODO: 
                                     todo!()
                                 }
                             }
                         },
                         // no choice
-                        Ok(op) => {
+                        Ok(_) => {
                             next = prog.operand_at(scan).unwrap();
                         }
-                        Err(err) => {
+                        Err(_) => {
                             return Err(Error::ExecuteFailed(
                                 self.looked_len,
                                 "match branch failed, opcode of next invalid",
@@ -890,7 +949,9 @@ impl<'a> Exec<'a> {
                         }
                     }
                 }
-                Opcode::STAR | Opcode::PLUS => {}
+                Opcode::STAR | Opcode::PLUS => {
+                    // TODO:
+                }
                 Opcode::END => return Ok(()),
                 _ => {
                     return Err(Error::ExecuteFailed(self.looked_len, "unexpected program"));
@@ -904,7 +965,41 @@ impl<'a> Exec<'a> {
             "unexpeced return point",
         ))
     }
-
+    // report how many times something simple would match
+    fn regrepeat(&self, prog: &Program, pc: PC) -> usize {
+        match prog.opcode_at(pc) {
+            Ok(op) if op == Opcode::STAR || op == Opcode::PLUS => { /* ok */ }
+            _ => panic!("call repeat with invalid opcode"),
+        }
+        let node = prog.operand_at(pc).unwrap();
+        match prog.opcode_at(node) {
+            Ok(Opcode::ANY) => {
+                // consider ".*"
+                self.reginput.as_str().len()
+            }
+            Ok(Opcode::ANYOF) => 0,
+            Ok(Opcode::ANYBUT) => 0,
+            Ok(Opcode::EXACTLY) => {
+                // exactly single char
+                let mut count = 0;
+                let ch = prog
+                    .operand_at(node)
+                    .expect("EXACTLY follow at least one character ");
+                let ch = prog.char_at(ch).expect("regex program corrupted");
+                let mut point = self.reginput.clone();
+                loop {
+                    match point.next() {
+                        Some(c) if c == ch => count += 1,
+                        _ => break,
+                    }
+                }
+                count
+            }
+            _ => {
+                panic!("call repeat with invalid oprand");
+            }
+        }
+    }
     fn next_char(&mut self) -> Option<char> {
         self.looked_len += 1;
         self.reginput.next()
@@ -944,6 +1039,32 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_program_char_at() {
+        let mut prog = Program::new();
+        let mut pc = PragramCounter(0);
+
+        let emit_char = |prog: &mut Program, ch: char| {
+            let buf = (ch as u32).to_be_bytes();
+            for b in buf {
+                prog.emit_byte(b);
+            }
+        };
+
+        {
+            emit_char(&mut prog, 'c');
+            assert_eq!(prog.char_at(pc), Some('c'));
+            pc += 4;
+        }
+        {
+            emit_char(&mut prog, 'a');
+            assert_eq!(prog.char_at(pc), Some('a'));
+            pc += 4;
+        }
+        {
+            assert_eq!(prog.char_at(pc), None);
+        }
+    }
     #[test]
     fn test_program_emit_byte() {
         let mut prog = Program::new();
@@ -1048,7 +1169,7 @@ mod test {
 
     #[test]
     fn test_regex_program_display() {
-        let re = Comp::regcomp("a|b").unwrap();
+        let re = Comp::regcomp("a*").unwrap();
         println!("{}", re.program);
     }
 
@@ -1073,5 +1194,7 @@ mod test {
         assert!(regexec("(a)*", "aaa").is_ok());
     }
     #[test]
-    fn test_regex_exec_err_simple() {}
+    fn test_regex_exec_err_simple() {
+        assert!(regexec("a*", "bbb").is_err());
+    }
 }
