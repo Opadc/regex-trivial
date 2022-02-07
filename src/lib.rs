@@ -1,7 +1,7 @@
 //! regex - Regular expression pattern matching and replacement
 //!
 //! ## Usage
-//!
+//! see regex.rs test mod
 //!
 //!
 //! ## Regular Expressions:
@@ -69,3 +69,5 @@
 extern crate enum_display_derive;
 
 mod regex;
+
+pub use regex::Regex;

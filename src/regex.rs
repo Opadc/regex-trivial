@@ -5,11 +5,9 @@ use itertools::{peek_nth, PeekNth};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 use std::{
-    cell::RefCell,
     collections::HashSet,
     fmt::Display,
     ops::{Add, AddAssign, Sub},
-    rc::Rc,
     str::Chars,
 };
 
@@ -324,15 +322,24 @@ impl<'a> Comp<'a> {
             emit_code: false,
             code_size: 0,
         };
+        if !exp.chars().all(|c| c.is_ascii()){
+            return Err(Error::InvalidRegex(comp.regposi, "uft-8 have not support"));
+        }
+        if exp.chars().any(|c| c.is_ascii_control()){
+            return Err(Error::InvalidRegex(comp.regposi, "exp contain control char"));
+        }
         comp.regc(Opcode::BEGIN.into());
         comp.reg(false).map_err(|err| match err {
             Error::InvalidRegex(mut posi, err_msg) => {
+                /* 
                 println!("{}", exp);
                 while posi > 0 {
                     print!(" ");
                     posi -= 1;
                 }
                 println!("^   {}", err_msg);
+
+                */
                 err
             }
             _ => panic!("internal error should not export here"),
@@ -649,6 +656,7 @@ impl<'a> Comp<'a> {
                     self.exp_advance();
                     ret = self.regnode(Opcode::EXACTLY);
                     self.regchar(ch);
+                    self.regchar('\0');
                     flags |= CompStatus::HASWIDTH | CompStatus::SIMPLE;
                 } else {
                     return Err(Error::InvalidRegex(self.regposi, "trailing \\"));
@@ -818,6 +826,12 @@ impl<'a> Exec<'a> {
             looked_len: 0,
             submatchs: Default::default(),
         };
+        if !s.chars().all(|c| c.is_ascii()){
+            return Err(Error::ExecuteFailed(exec.looked_len, "utf-8 have not support"));
+        }
+        if s.chars().any(|c| c.is_ascii_control()){
+            return Err(Error::ExecuteFailed(exec.looked_len, "string contain control char"));
+        }
         let prog = &mut comp.program;
         let pc = PragramCounter(0);
         let first_op = prog
@@ -1131,15 +1145,28 @@ impl<'a> Exec<'a> {
     }
 }
 
-pub struct Regex<'a> {
-    program: Program,
-    submatchs: [Option<SubMatch<'a>>; MAX_SUB_EXP],
+pub struct Regex<'a, 'b> {
+    comp: Comp<'a>,
+    exec: Option<Exec<'b>>,
 }
-impl<'a> Regex<'a> {
+impl<'a,'b> Regex<'a,'b> {
     pub fn new(re: &str) -> Result<Regex, Error> {
-        todo!()
+        let comp = Comp::regcomp(re)?;
+        let regex =  Regex{
+            comp,
+            exec: None,
+        };
+        Ok(regex)
     }
-    pub fn find(&mut self, s: &str) {}
+    pub fn is_match(&mut self, s: &'b str)-> bool {
+        let exec = Exec::regexec(&mut self.comp, s);
+        if exec.is_err(){
+            false
+        }else{
+            self.exec = Some(exec.unwrap());
+            true
+        }
+    }
     pub fn captures(&self) {}
 }
 
@@ -1292,6 +1319,8 @@ mod test {
         assert!(regcomp("[a-z]|[1-9]").is_ok());
         assert!(regcomp("[a-z][1-9]").is_ok());
         assert!(regcomp("hello world! Have a good day.").is_ok());
+        assert!(regcomp("(bc+d$|ef*g.|h?i(j|k))").is_ok());
+        assert!(regcomp("\\[").is_ok());
     }
     #[test]
     fn test_regex_comp_err_simple() {
@@ -1301,7 +1330,7 @@ mod test {
 
     #[test]
     fn test_regex_program_display() {
-        let re = Comp::regcomp("[a-z]").unwrap();
+        let re = Comp::regcomp("(bc+d$|ef*g.|h?i(j|k))").unwrap();
         println!("{}", re.program);
     }
 
@@ -1331,9 +1360,37 @@ mod test {
         assert!(regexec("[^a-z]*", "1").is_ok());
     }
 
+
     #[test]
-    fn tmp() {
-        assert!(regexec("[a-z]*", "absdawa").is_ok());
+    fn fuzz_tmp(){
+       if let Ok(comp) = Comp::regcomp("r\x00\x00\x00"){
+           println!("{}", comp.program);
+       }
+    }
+    #[test]
+    fn fuzz() {
+        let data: Vec<u8> = vec![189, 46, 43, 46, 119, 46, 15, 0, 0, 43, 46, 46, 15, 0, 119, 217, 159];
+        if data.len() < 2 {
+            return;
+        }
+        let split_point = data[0] as usize;
+        if let Ok(data) = std::str::from_utf8(&data[1..]) {
+            use std::cmp::max;
+            // split data into regular expression and actual input to search through
+            let len = data.chars().count();
+            let split_off_point = max(split_point, 1) % len as usize;
+            let char_index = data.char_indices().nth(split_off_point);
+            if let Some((char_index, _)) = char_index {
+                let (pattern, input) = data.split_at(char_index);
+                println!("pattern: {}",pattern);
+                println!("input: {}",input);
+                if let Ok(mut re) = Regex::new(pattern) {
+                    println!("{}", &re.comp.program);
+                    re.is_match(input);
+                }
+            }
+        }
+        
     }
     #[test]
     fn test_regex_exec_err_simple() {
